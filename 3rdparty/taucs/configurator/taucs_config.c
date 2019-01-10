@@ -917,8 +917,8 @@ int main(int argc, char* argv[])
   map_sources_to_targets();
 
   emit_configfile(get_configuration_name(defaultfile));
-
-  emit_makefile(get_configuration_name(defaultfile));
+  // Patched
+  // emit_makefile(get_configuration_name(defaultfile));
 
   if (outfile)
     emit_outfile(outfile);

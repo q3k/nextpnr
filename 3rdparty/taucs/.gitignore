@@ -1,0 +1,10 @@
+configurator/configurator
+makefile
+*.o
+*.a
+*.so
+bin/
+lib/
+obj/
+build/
+
