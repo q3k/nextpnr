@@ -23,6 +23,7 @@
 #include <boost/range/adaptor/reversed.hpp>
 #include <cmath>
 #include <cstring>
+#include "placer_heap.h"
 #include "gfx.h"
 #include "globals.h"
 #include "log.h"
@@ -478,7 +479,7 @@ bool Arch::getBudgetOverride(const NetInfo *net_info, const PortRef &sink, delay
 
 // -----------------------------------------------------------------------
 
-bool Arch::place() { return placer1(getCtx(), Placer1Cfg(getCtx())); }
+bool Arch::place() { return placer_heap(getCtx()); }
 
 bool Arch::route()
 {
