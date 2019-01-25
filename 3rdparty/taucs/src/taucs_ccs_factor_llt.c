@@ -125,14 +125,14 @@ static void spa_scale_add(spa* s, int j, taucs_ccs_matrix* A, int k, taucs_datat
 /* linked lists for rows                                 */
 /*********************************************************/
 
-static int*            rowlist;
-static int*            rowlist_next;
-static int*            rowlist_colind;
-static taucs_datatype* rowlist_values;
+static __thread int*            rowlist;
+static __thread int*            rowlist_next;
+static __thread int*            rowlist_colind;
+static __thread taucs_datatype* rowlist_values;
 
-static int     rowlist_freelist;
-static int     rowlist_size;
-static int     rowlist_next_expansion;
+static __thread int     rowlist_freelist;
+static __thread int     rowlist_size;
+static __thread int     rowlist_next_expansion;
 
 static int rowlist_create(int n)
 {
