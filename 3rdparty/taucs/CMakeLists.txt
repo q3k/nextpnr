@@ -57,4 +57,4 @@ target_include_directories(taucs_double PRIVATE src external/src  ${TAUCS_CONFIG
 
 add_library(taucs STATIC ${TAUCS_CONFIG_BUILD} $<TARGET_OBJECTS:taucs_general> $<TARGET_OBJECTS:taucs_double>)
 target_include_directories(taucs PRIVATE src external/src ${TAUCS_CONFIG_DIR})
-target_link_libraries(taucs PRIVATE blas f2c m)
+target_link_libraries(taucs PRIVATE blas m)
