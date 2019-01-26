@@ -5,8 +5,8 @@ if (MSVC)
     set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} /D_DEBUG")
     set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /W4")
 else()
-    set(CMAKE_C_FLAGS_DEBUG "-Wall -fPIC -ggdb -pipe")
-    set(CMAKE_C_FLAGS_RELEASE "-Wall -fPIC -O3 -g")
+    set(CMAKE_C_FLAGS_DEBUG "-fPIC -ggdb -pipe")
+    set(CMAKE_C_FLAGS_RELEASE "-fPIC -O3 -g")
 endif()
 
 if(WIN32)
@@ -28,11 +28,10 @@ add_custom_command(OUTPUT ${TAUCS_CONFIG_BUILD}
 )
 
 file(WRITE ${TAUCS_CONFIG_TESTS} "#define TAUCS_CORE\n#define TAUCS_BLAS_NOUNDERSCORE\n#include <cblas.h>\n")
-aux_source_directory(external/src TAUCS_EXT_SRC)
 # Need to build similar set of files twice with different flags
 set(TAUCS_GENERAL_FILES src/taucs_sn_llt.c src/taucs_linsolve.c src/taucs_logging.c src/taucs_memory.c src/taucs_timer.c
-        src/taucs_ccs_base.c src/taucs_vec_base.c src/taucs_ccs_ops.c src/taucs_ccs_io.c src/taucs_ccs_order.c
-        src/taucs_ccs_factor_llt.c src/taucs_ccs_solve_llt.c src/taucs_complex.c src/taucs_ccs_ooc_llt.c src/taucs_ccs_ooc_lu.c
+        src/taucs_ccs_base.c src/taucs_vec_base.c src/taucs_ccs_ops.c src/taucs_ccs_io.c src/taucs_ccs_factor_llt.c
+        src/taucs_ccs_solve_llt.c src/taucs_complex.c src/taucs_ccs_ooc_llt.c src/taucs_ccs_ooc_lu.c
         src/taucs_ooc_io.c src/taucs_malloc.c)
 
 set(TAUCS_DOUBLE_FILES src/taucs_sn_llt.c src/taucs_ccs_base.c src/taucs_vec_base.c src/taucs_ccs_ops.c src/taucs_ccs_io.c
