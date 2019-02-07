@@ -16,8 +16,6 @@
 /* Interface to AMD                                      */
 /*********************************************************/
 
-#include "../external/src/colamd.h"
-
 static void
 taucs_ccs_colamd(taucs_ccs_matrix* m, 
 		 int** perm, int** invperm,
