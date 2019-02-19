@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <boost/optional.hpp>
 #include <iterator>
+#include <queue>
 #include <unordered_set>
 #include "cells.h"
 #include "chain_utils.h"
@@ -1396,6 +1397,178 @@ class Ecp5Packer
         return a->driver.cell->type == b->driver.cell->type;
     }
 
+    struct EdgeClockInfo
+    {
+        CellInfo *buffer = nullptr;
+        NetInfo *unbuf = nullptr;
+        NetInfo *buf = nullptr;
+    };
+
+    std::map<std::pair<int, int>, EdgeClockInfo> eclks;
+
+    void make_eclk(PortInfo &usr_port, CellInfo *usr_cell, BelId usr_bel, int bank)
+    {
+        NetInfo *ecknet = usr_port.net;
+        if (ecknet == nullptr)
+            log_error("Input '%s' of cell '%s' cannot be disconnected\n", usr_port.name.c_str(ctx),
+                      usr_cell->name.c_str(ctx));
+        int found_eclk = -1, free_eclk = -1;
+        for (int i = 0; i < 2; i++) {
+            if (eclks.count(std::make_pair(bank, i))) {
+                if (eclks.at(std::make_pair(bank, i)).unbuf == ecknet) {
+                    found_eclk = i;
+                    break;
+                }
+            } else if (free_eclk == -1) {
+                free_eclk = i;
+            }
+        }
+        if (found_eclk == -1) {
+            if (free_eclk == -1) {
+                log_error("Unable to promote edge clock '%s' for bank %d. 2/2 edge clocks already used by '%s' and "
+                          "'%s'.\n",
+                          ecknet->name.c_str(ctx), bank, eclks.at(std::make_pair(bank, 0)).unbuf->name.c_str(ctx),
+                          eclks.at(std::make_pair(bank, 1)).unbuf->name.c_str(ctx));
+            } else {
+                log_info("Promoted '%s' to bank %d ECLK%d.\n", ecknet->name.c_str(ctx), bank, free_eclk);
+                auto &eclk = eclks[std::make_pair(bank, free_eclk)];
+                eclk.unbuf = ecknet;
+                IdString eckname = ctx->id(ecknet->name.str(ctx) + "$eclk" + std::to_string(bank) + "_" +
+                                           std::to_string(free_eclk));
+
+                std::unique_ptr<NetInfo> promoted_ecknet(new NetInfo);
+                promoted_ecknet->name = eckname;
+                promoted_ecknet->is_global = true; // Prevents router etc touching this special net
+                eclk.buf = promoted_ecknet.get();
+                NPNR_ASSERT(!ctx->nets.count(eckname));
+                ctx->nets[eckname] = std::move(promoted_ecknet);
+
+                // Insert TRELLIS_ECLKBUF to isolate edge clock from general routing
+                std::unique_ptr<CellInfo> eclkbuf =
+                        create_ecp5_cell(ctx, id_TRELLIS_ECLKBUF, eckname.str(ctx) + "$buffer");
+                BelId target_bel;
+                // Find the correct Bel for the ECLKBUF
+                IdString eclkname = ctx->id("G_BANK" + std::to_string(bank) + "ECLK" + std::to_string(free_eclk));
+                for (auto bel : ctx->getBels()) {
+                    if (ctx->getBelType(bel) != id_TRELLIS_ECLKBUF)
+                        continue;
+                    if (ctx->getWireBasename(ctx->getBelPinWire(bel, id_ECLKO)) != eclkname)
+                        continue;
+                    target_bel = bel;
+                    break;
+                }
+                NPNR_ASSERT(target_bel != BelId());
+
+                eclkbuf->attrs[ctx->id("BEL")] = ctx->getBelName(target_bel).str(ctx);
+
+                connect_port(ctx, ecknet, eclkbuf.get(), id_ECLKI);
+                connect_port(ctx, eclk.buf, eclkbuf.get(), id_ECLKO);
+                found_eclk = free_eclk;
+                eclk.buffer = eclkbuf.get();
+                new_cells.push_back(std::move(eclkbuf));
+            }
+        }
+
+        auto &eclk = eclks[std::make_pair(bank, found_eclk)];
+        disconnect_port(ctx, usr_cell, usr_port.name);
+        usr_port.net = nullptr;
+        connect_port(ctx, eclk.buf, usr_cell, usr_port.name);
+
+        // Simple ECLK router
+        WireId userWire = ctx->getBelPinWire(usr_bel, usr_port.name);
+        IdString bnke_name = ctx->id("BNK_ECLK" + std::to_string(found_eclk));
+        IdString global_name = ctx->id("G_BANK" + std::to_string(bank) + "ECLK" + std::to_string(found_eclk));
+
+        std::queue<WireId> upstream;
+        std::unordered_map<WireId, PipId> backtrace;
+        upstream.push(userWire);
+        WireId next;
+        while (true) {
+            if (upstream.empty() || upstream.size() > 30000)
+                log_error("failed to route bank %d ECLK%d to %s.%s\n", bank, found_eclk,
+                          ctx->getBelName(usr_bel).c_str(ctx), usr_port.name.c_str(ctx));
+            next = upstream.front();
+            upstream.pop();
+            if (ctx->debug)
+                log_info("    visited %s\n", ctx->getWireName(next).c_str(ctx));
+            IdString basename = ctx->getWireBasename(next);
+            if (basename == bnke_name || basename == global_name) {
+                break;
+            }
+            if (ctx->checkWireAvail(next)) {
+                for (auto pip : ctx->getPipsUphill(next)) {
+                    WireId src = ctx->getPipSrcWire(pip);
+                    backtrace[src] = pip;
+                    upstream.push(src);
+                }
+            }
+        }
+        // Set all the pips we found along the way
+        WireId cursor = next;
+        while (true) {
+            auto fnd = backtrace.find(cursor);
+            if (fnd == backtrace.end())
+                break;
+            ctx->bindPip(fnd->second, eclk.buf, STRENGTH_LOCKED);
+            cursor = ctx->getPipDstWire(fnd->second);
+        }
+    }
+    std::unordered_map<IdString, std::pair<bool, int>> dqsbuf_dqsg;
+
+    // Pack DQSBUFs
+    void pack_dqsbuf()
+    {
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->type == id_DQSBUFM) {
+                CellInfo *pio = net_driven_by(ctx, ci->ports.at(ctx->id("DQSI")).net, is_trellis_io, id_O);
+                if (pio == nullptr || ci->ports.at(ctx->id("DQSI")).net->users.size() > 1)
+                    log_error("DQSBUFM '%s' DQSI input must be connected only to a top level input\n",
+                              ci->name.c_str(ctx));
+                if (!pio->attrs.count(ctx->id("BEL")))
+                    log_error("DQSBUFM can only be used with a pin-constrained PIO connected to its DQSI input"
+                              "(while processing '%s').\n",
+                              ci->name.c_str(ctx));
+                BelId pio_bel = ctx->getBelByName(ctx->id(pio->attrs.at(ctx->id("BEL"))));
+                NPNR_ASSERT(pio_bel != BelId());
+                Loc pio_loc = ctx->getBelLocation(pio_bel);
+                if (pio_loc.z != 0)
+                    log_error("PIO '%s' does not appear to be a DQS site (expecting an 'A' pin).\n",
+                              ctx->getBelName(pio_bel).c_str(ctx));
+                pio_loc.z = 8;
+                BelId dqsbuf = ctx->getBelByLocation(pio_loc);
+                if (dqsbuf == BelId() || ctx->getBelType(dqsbuf) != id_DQSBUFM)
+                    log_error("PIO '%s' does not appear to be a DQS site (didn't find a DQSBUFM).\n",
+                              ctx->getBelName(pio_bel).c_str(ctx));
+                ci->attrs[ctx->id("BEL")] = ctx->getBelName(dqsbuf).str(ctx);
+                bool got_dqsg = ctx->getPIODQSGroup(pio_bel, dqsbuf_dqsg[ci->name].first, dqsbuf_dqsg[ci->name].second);
+                NPNR_ASSERT(got_dqsg);
+                log_info("Constrained DQSBUFM '%s' to %cDQS%d\n", ci->name.c_str(ctx),
+                         dqsbuf_dqsg[ci->name].first ? 'R' : 'L', dqsbuf_dqsg[ci->name].second);
+
+                // Set all special ports, if used as 'globals' that the router won't touch
+                for (auto port : {id_DQSR90, id_RDPNTR0, id_RDPNTR1, id_RDPNTR2, id_WRPNTR0, id_WRPNTR1, id_WRPNTR2,
+                                  id_DQSW270, id_DQSW}) {
+                    if (!ci->ports.count(port))
+                        continue;
+                    NetInfo *pn = ci->ports.at(port).net;
+                    if (pn == nullptr)
+                        continue;
+                    for (auto &usr : pn->users) {
+                        if (usr.port != port ||
+                            (usr.cell->type != ctx->id("ODDRX2DQA") && usr.cell->type != ctx->id("ODDRX2DQSB") &&
+                             usr.cell->type != ctx->id("TSHX2DQSA") && usr.cell->type != ctx->id("IDDRX2DQA") &&
+                             usr.cell->type != ctx->id("TSHX2DQA") && usr.cell->type != id_IOLOGIC))
+                            log_error("Port '%s' of DQSBUFM '%s' cannot drive port '%s' of cell '%s'.\n",
+                                      port.c_str(ctx), ci->name.c_str(ctx), usr.port.c_str(ctx),
+                                      usr.cell->name.c_str(ctx));
+                    }
+                    pn->is_global = true;
+                }
+            }
+        }
+    }
+
     // Pack IOLOGIC
     void pack_iologic()
     {
@@ -1421,6 +1594,24 @@ class Ecp5Packer
                 disconnect_port(ctx, prim, port);
         };
 
+        auto set_iologic_eclk = [&](CellInfo *iol, CellInfo *prim, IdString port) {
+            NetInfo *eclk = nullptr;
+            if (prim->ports.count(port))
+                eclk = prim->ports[port].net;
+            if (eclk == nullptr)
+                log_error("%s '%s' cannot have disconnected ECLK", prim->type.c_str(ctx), prim->name.c_str(ctx));
+
+            if (iol->ports[id_ECLK].net != nullptr) {
+                if (iol->ports[id_ECLK].net != eclk)
+                    log_error("IOLOGIC '%s' has conflicting ECLKs '%s' and '%s'\n", iol->name.c_str(ctx),
+                              iol->ports[id_ECLK].net->name.c_str(ctx), eclk->name.c_str(ctx));
+            } else {
+                connect_port(ctx, eclk, iol, id_ECLK);
+            }
+            if (prim->ports.count(port))
+                disconnect_port(ctx, prim, port);
+        };
+
         auto set_iologic_lsr = [&](CellInfo *iol, CellInfo *prim, IdString port, bool input) {
             NetInfo *lsr = nullptr;
             if (prim->ports.count(port))
@@ -1433,7 +1624,7 @@ class Ecp5Packer
                     if (iol->ports[id_LSR].net != lsr)
                         log_error("IOLOGIC '%s' has conflicting LSR signals '%s' and '%s'\n", iol->name.c_str(ctx),
                                   iol->ports[id_LSR].net->name.c_str(ctx), lsr->name.c_str(ctx));
-                } else {
+                } else if (iol->ports[id_LSR].net == nullptr) {
                     connect_port(ctx, lsr, iol, id_LSR);
                 }
             }
@@ -1446,16 +1637,24 @@ class Ecp5Packer
             if (curr_mode != "NONE" && curr_mode != mode)
                 log_error("IOLOGIC '%s' has conflicting modes '%s' and '%s'\n", iol->name.c_str(ctx), curr_mode.c_str(),
                           mode.c_str());
+            if (iol->type == id_SIOLOGIC && mode != "IREG_OREG" && mode != "IDDRX1_ODDRX1" && mode != "NONE")
+                log_error("IOLOGIC '%s' is set to mode '%s', but this is only supported for left and right IO\n",
+                          iol->name.c_str(ctx), mode.c_str());
             curr_mode = mode;
         };
 
-        auto create_pio_iologic = [&](CellInfo *pio, CellInfo *curr) {
+        auto get_pio_bel = [&](CellInfo *pio, CellInfo *curr) {
             if (!pio->attrs.count(ctx->id("BEL")))
                 log_error("IOLOGIC functionality (DDR, DELAY, DQS, etc) can only be used with pin-constrained PIO "
                           "(while processing '%s').\n",
                           curr->name.c_str(ctx));
             BelId bel = ctx->getBelByName(ctx->id(pio->attrs.at(ctx->id("BEL"))));
             NPNR_ASSERT(bel != BelId());
+            return bel;
+        };
+
+        auto create_pio_iologic = [&](CellInfo *pio, CellInfo *curr) {
+            BelId bel = get_pio_bel(pio, curr);
             log_info("IOLOGIC component %s connected to PIO Bel %s\n", curr->name.c_str(ctx),
                      ctx->getBelName(bel).c_str(ctx));
             Loc loc = ctx->getBelLocation(bel);
@@ -1472,6 +1671,40 @@ class Ecp5Packer
             pio_iologic[pio->name] = iol_ptr;
             new_cells.push_back(std::move(iol));
             return iol_ptr;
+        };
+
+        auto process_dqs_port = [&](CellInfo *prim, CellInfo *pio, CellInfo *iol, IdString port) {
+            NetInfo *sig = nullptr;
+            if (prim->ports.count(port))
+                sig = prim->ports[port].net;
+            if (sig == nullptr || sig->driver.cell == nullptr)
+                log_error("Port %s of cell '%s' cannot be disconnected, it must be driven by a DQSBUFM\n",
+                          port.c_str(ctx), prim->name.c_str(ctx));
+            if (iol->ports.at(port).net != nullptr) {
+                if (iol->ports.at(port).net != sig) {
+                    log_error("IOLOGIC '%s' has conflicting %s signals '%s' and '%s'\n", iol->name.c_str(ctx),
+                              port.c_str(ctx), iol->ports[port].net->name.c_str(ctx), sig->name.c_str(ctx));
+                }
+                disconnect_port(ctx, prim, port);
+            } else {
+                bool dqsr;
+                int dqsgroup;
+                bool has_dqs = ctx->getPIODQSGroup(get_pio_bel(pio, prim), dqsr, dqsgroup);
+                if (!has_dqs)
+                    log_error("Primitive '%s' cannot be connected to top level port '%s' as the associated pin is not "
+                              "in any DQS group",
+                              prim->name.c_str(ctx), pio->name.c_str(ctx));
+                if (sig->driver.cell->type != id_DQSBUFM || sig->driver.port != port)
+                    log_error("Port %s of cell '%s' must be driven by port %s of a DQSBUFM", port.c_str(ctx),
+                              prim->name.c_str(ctx), port.c_str(ctx));
+                auto &driver_group = dqsbuf_dqsg.at(sig->driver.cell->name);
+                if (driver_group.first != dqsr || driver_group.second != dqsgroup)
+                    log_error("DQS group mismatch, port %s of '%s' in group %cDQ%d is driven by DQSBUFM '%s' in group "
+                              "%cDQ%d\n",
+                              port.c_str(ctx), prim->name.c_str(ctx), dqsr ? 'R' : 'L', dqsgroup,
+                              sig->driver.cell->name.c_str(ctx), driver_group.first ? 'R' : 'L', driver_group.second);
+                replace_port(prim, port, iol, port);
+            }
         };
 
         for (auto cell : sorted(ctx->cells)) {
@@ -1518,8 +1751,273 @@ class Ecp5Packer
                 replace_port(ci, ctx->id("D1"), iol, id_TXDATA1);
                 iol->params[ctx->id("GSR")] = str_or_default(ci->params, ctx->id("GSR"), "DISABLED");
                 packed_cells.insert(cell.first);
+            } else if (ci->type == ctx->id("ODDRX2F")) {
+                CellInfo *pio = net_only_drives(ctx, ci->ports.at(ctx->id("Q")).net, is_trellis_io, id_I, true);
+                if (pio == nullptr)
+                    log_error("ODDRX2F '%s' Q output must be connected only to a top level output\n",
+                              ci->name.c_str(ctx));
+                CellInfo *iol;
+                if (pio_iologic.count(pio->name))
+                    iol = pio_iologic.at(pio->name);
+                else
+                    iol = create_pio_iologic(pio, ci);
+                set_iologic_mode(iol, "ODDRXN");
+                replace_port(ci, ctx->id("Q"), iol, id_IOLDO);
+                if (!pio->ports.count(id_IOLDO)) {
+                    pio->ports[id_IOLDO].name = id_IOLDO;
+                    pio->ports[id_IOLDO].type = PORT_IN;
+                }
+                replace_port(pio, id_I, pio, id_IOLDO);
+                set_iologic_sclk(iol, ci, ctx->id("SCLK"), false);
+                set_iologic_eclk(iol, ci, id_ECLK);
+                set_iologic_lsr(iol, ci, ctx->id("RST"), false);
+                replace_port(ci, ctx->id("D0"), iol, id_TXDATA0);
+                replace_port(ci, ctx->id("D1"), iol, id_TXDATA1);
+                replace_port(ci, ctx->id("D2"), iol, id_TXDATA2);
+                replace_port(ci, ctx->id("D3"), iol, id_TXDATA3);
+                iol->params[ctx->id("GSR")] = str_or_default(ci->params, ctx->id("GSR"), "DISABLED");
+                iol->params[ctx->id("ODDRXN.MODE")] = "ODDRX2";
+                pio->params[ctx->id("DATAMUX_ODDR")] = "IOLDO";
+                packed_cells.insert(cell.first);
+            } else if (ci->type == ctx->id("IDDRX2F")) {
+                CellInfo *pio = net_driven_by(ctx, ci->ports.at(ctx->id("D")).net, is_trellis_io, id_O);
+                if (pio == nullptr || ci->ports.at(ctx->id("D")).net->users.size() > 1)
+                    log_error("IDDRX2F '%s' D input must be connected only to a top level input\n",
+                              ci->name.c_str(ctx));
+                CellInfo *iol;
+                if (pio_iologic.count(pio->name))
+                    iol = pio_iologic.at(pio->name);
+                else
+                    iol = create_pio_iologic(pio, ci);
+                set_iologic_mode(iol, "IDDRXN");
+                replace_port(ci, ctx->id("D"), iol, id_PADDI);
+                set_iologic_sclk(iol, ci, ctx->id("SCLK"), true);
+                set_iologic_eclk(iol, ci, id_ECLK);
+                set_iologic_lsr(iol, ci, ctx->id("RST"), true);
+                replace_port(ci, ctx->id("Q0"), iol, id_RXDATA0);
+                replace_port(ci, ctx->id("Q1"), iol, id_RXDATA1);
+                replace_port(ci, ctx->id("Q2"), iol, id_RXDATA2);
+                replace_port(ci, ctx->id("Q3"), iol, id_RXDATA3);
+                iol->params[ctx->id("GSR")] = str_or_default(ci->params, ctx->id("GSR"), "DISABLED");
+                iol->params[ctx->id("IDDRXN.MODE")] = "IDDRX2";
+                packed_cells.insert(cell.first);
+            } else if (ci->type == ctx->id("OSHX2A")) {
+                CellInfo *pio = net_only_drives(ctx, ci->ports.at(ctx->id("Q")).net, is_trellis_io, id_I, true);
+                if (pio == nullptr)
+                    log_error("OSHX2A '%s' Q output must be connected only to a top level output\n",
+                              ci->name.c_str(ctx));
+                CellInfo *iol;
+                if (pio_iologic.count(pio->name))
+                    iol = pio_iologic.at(pio->name);
+                else
+                    iol = create_pio_iologic(pio, ci);
+                set_iologic_mode(iol, "MIDDRX_MODDRX");
+                replace_port(ci, ctx->id("Q"), iol, id_IOLDO);
+                if (!pio->ports.count(id_IOLDO)) {
+                    pio->ports[id_IOLDO].name = id_IOLDO;
+                    pio->ports[id_IOLDO].type = PORT_IN;
+                }
+                replace_port(pio, id_I, pio, id_IOLDO);
+                set_iologic_sclk(iol, ci, ctx->id("SCLK"), false);
+                set_iologic_eclk(iol, ci, id_ECLK);
+                set_iologic_lsr(iol, ci, ctx->id("RST"), false);
+                replace_port(ci, ctx->id("D0"), iol, id_TXDATA0);
+                replace_port(ci, ctx->id("D1"), iol, id_TXDATA2);
+                iol->params[ctx->id("GSR")] = str_or_default(ci->params, ctx->id("GSR"), "DISABLED");
+                iol->params[ctx->id("MODDRX.MODE")] = "MOSHX2";
+                pio->params[ctx->id("DATAMUX_MDDR")] = "IOLDO";
+                packed_cells.insert(cell.first);
+            } else if (ci->type == ctx->id("ODDRX2DQA") || ci->type == ctx->id("ODDRX2DQSB")) {
+                CellInfo *pio = net_only_drives(ctx, ci->ports.at(ctx->id("Q")).net, is_trellis_io, id_I, true);
+                if (pio == nullptr)
+                    log_error("%s '%s' Q output must be connected only to a top level output\n", ci->type.c_str(ctx),
+                              ci->name.c_str(ctx));
+                CellInfo *iol;
+                if (pio_iologic.count(pio->name))
+                    iol = pio_iologic.at(pio->name);
+                else
+                    iol = create_pio_iologic(pio, ci);
+                set_iologic_mode(iol, "MIDDRX_MODDRX");
+                replace_port(ci, ctx->id("Q"), iol, id_IOLDO);
+                if (!pio->ports.count(id_IOLDO)) {
+                    pio->ports[id_IOLDO].name = id_IOLDO;
+                    pio->ports[id_IOLDO].type = PORT_IN;
+                }
+                replace_port(pio, id_I, pio, id_IOLDO);
+                set_iologic_sclk(iol, ci, ctx->id("SCLK"), false);
+                set_iologic_eclk(iol, ci, id_ECLK);
+                set_iologic_lsr(iol, ci, ctx->id("RST"), false);
+                replace_port(ci, ctx->id("D0"), iol, id_TXDATA0);
+                replace_port(ci, ctx->id("D1"), iol, id_TXDATA1);
+                replace_port(ci, ctx->id("D2"), iol, id_TXDATA2);
+                replace_port(ci, ctx->id("D3"), iol, id_TXDATA3);
+                iol->params[ctx->id("GSR")] = str_or_default(ci->params, ctx->id("GSR"), "DISABLED");
+                iol->params[ctx->id("MODDRX.MODE")] = "MODDRX2";
+                iol->params[ctx->id("MIDDRX_MODDRX.WRCLKMUX")] = ci->type == ctx->id("ODDRX2DQSB") ? "DQSW" : "DQSW270";
+                process_dqs_port(ci, pio, iol, ci->type == ctx->id("ODDRX2DQSB") ? id_DQSW : id_DQSW270);
+                pio->params[ctx->id("DATAMUX_MDDR")] = "IOLDO";
+                packed_cells.insert(cell.first);
+            } else if (ci->type == ctx->id("IDDRX2DQA")) {
+                CellInfo *pio = net_driven_by(ctx, ci->ports.at(ctx->id("D")).net, is_trellis_io, id_O);
+                if (pio == nullptr || ci->ports.at(ctx->id("D")).net->users.size() > 1)
+                    log_error("IDDRX2DQA '%s' D input must be connected only to a top level input\n",
+                              ci->name.c_str(ctx));
+                CellInfo *iol;
+                if (pio_iologic.count(pio->name))
+                    iol = pio_iologic.at(pio->name);
+                else
+                    iol = create_pio_iologic(pio, ci);
+                set_iologic_mode(iol, "MIDDRX_MODDRX");
+                replace_port(ci, ctx->id("D"), iol, id_PADDI);
+                set_iologic_sclk(iol, ci, ctx->id("SCLK"), true);
+                set_iologic_eclk(iol, ci, id_ECLK);
+                set_iologic_lsr(iol, ci, ctx->id("RST"), true);
+                replace_port(ci, ctx->id("Q0"), iol, id_RXDATA0);
+                replace_port(ci, ctx->id("Q1"), iol, id_RXDATA1);
+                replace_port(ci, ctx->id("Q2"), iol, id_RXDATA2);
+                replace_port(ci, ctx->id("Q3"), iol, id_RXDATA3);
+                replace_port(ci, ctx->id("QWL"), iol, id_INFF);
+                iol->params[ctx->id("GSR")] = str_or_default(ci->params, ctx->id("GSR"), "DISABLED");
+                iol->params[ctx->id("MIDDRX.MODE")] = "MIDDRX2";
+                process_dqs_port(ci, pio, iol, id_DQSR90);
+                process_dqs_port(ci, pio, iol, id_RDPNTR2);
+                process_dqs_port(ci, pio, iol, id_RDPNTR1);
+                process_dqs_port(ci, pio, iol, id_RDPNTR0);
+                process_dqs_port(ci, pio, iol, id_WRPNTR2);
+                process_dqs_port(ci, pio, iol, id_WRPNTR1);
+                process_dqs_port(ci, pio, iol, id_WRPNTR0);
+                packed_cells.insert(cell.first);
+            } else if (ci->type == ctx->id("TSHX2DQA") || ci->type == ctx->id("TSHX2DQSA")) {
+                CellInfo *pio = net_only_drives(ctx, ci->ports.at(ctx->id("Q")).net, is_trellis_io, id_T, true);
+                if (pio == nullptr)
+                    log_error("%s '%s' Q output must be connected only to a top level tristate\n", ci->type.c_str(ctx),
+                              ci->name.c_str(ctx));
+                CellInfo *iol;
+                if (pio_iologic.count(pio->name))
+                    iol = pio_iologic.at(pio->name);
+                else
+                    iol = create_pio_iologic(pio, ci);
+                set_iologic_mode(iol, "MIDDRX_MODDRX");
+                replace_port(ci, ctx->id("Q"), iol, id_IOLTO);
+                if (!pio->ports.count(id_IOLTO)) {
+                    pio->ports[id_IOLTO].name = id_IOLTO;
+                    pio->ports[id_IOLTO].type = PORT_IN;
+                }
+                replace_port(pio, id_T, pio, id_IOLTO);
+                set_iologic_sclk(iol, ci, ctx->id("SCLK"), false);
+                set_iologic_eclk(iol, ci, id_ECLK);
+                set_iologic_lsr(iol, ci, ctx->id("RST"), false);
+                replace_port(ci, ctx->id("T0"), iol, id_TSDATA0);
+                replace_port(ci, ctx->id("T1"), iol, id_TSDATA1);
+                process_dqs_port(ci, pio, iol, ci->type == ctx->id("TSHX2DQSA") ? id_DQSW : id_DQSW270);
+                iol->params[ctx->id("GSR")] = str_or_default(ci->params, ctx->id("GSR"), "DISABLED");
+                iol->params[ctx->id("MTDDRX.MODE")] = "MTSHX2";
+                iol->params[ctx->id("MTDDRX.DQSW_INVERT")] = ci->type == ctx->id("TSHX2DQSA") ? "ENABLED" : "DISABLED";
+                iol->params[ctx->id("MIDDRX_MODDRX.WRCLKMUX")] = ci->type == ctx->id("TSHX2DQSA") ? "DQSW" : "DQSW270";
+                iol->params[ctx->id("IOLTOMUX")] = "TDDR";
+                packed_cells.insert(cell.first);
             }
         }
+        flush_cells();
+        // Promote/route edge clocks
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->type == id_IOLOGIC || ci->type == id_DQSBUFM) {
+                if (!ci->ports.count(id_ECLK) || ci->ports.at(id_ECLK).net == nullptr)
+                    continue;
+                BelId bel = ctx->getBelByName(ctx->id(str_or_default(ci->attrs, ctx->id("BEL"))));
+                NPNR_ASSERT(bel != BelId());
+                Loc pioLoc = ctx->getBelLocation(bel);
+                if (ci->type == id_DQSBUFM)
+                    pioLoc.z -= 8;
+                else
+                    pioLoc.z -= 4;
+                BelId pioBel = ctx->getBelByLocation(pioLoc);
+                NPNR_ASSERT(pioBel != BelId());
+                int bank = ctx->getPioBelBank(pioBel);
+                make_eclk(ci->ports.at(id_ECLK), ci, bel, bank);
+            }
+        }
+        flush_cells();
+        // Constrain ECLK-related cells
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->type == id_CLKDIVF) {
+                const NetInfo *clki = net_or_nullptr(ci, id_CLKI);
+                for (auto &eclk : eclks) {
+                    if (eclk.second.unbuf == clki) {
+                        for (auto bel : ctx->getBels()) {
+                            if (ctx->getBelType(bel) != id_CLKDIVF)
+                                continue;
+                            Loc loc = ctx->getBelLocation(bel);
+                            // CLKDIVF for bank 6/7 on the left; for bank 2/3 on the right
+                            if (loc.x < 10 && eclk.first.first != 6 && eclk.first.first != 7)
+                                continue;
+                            // z-index of CLKDIVF must match index of ECLK
+                            if (loc.z != eclk.first.second)
+                                continue;
+                            ci->attrs[ctx->id("BEL")] = ctx->getBelName(bel).str(ctx);
+                            make_eclk(ci->ports.at(id_CLKI), ci, bel, eclk.first.first);
+                            goto clkdiv_done;
+                        }
+                    }
+                }
+            clkdiv_done:
+                continue;
+            } else if (ci->type == id_ECLKSYNCB) {
+                const NetInfo *eclko = net_or_nullptr(ci, id_ECLKO);
+                if (eclko == nullptr)
+                    log_error("ECLKSYNCB '%s' has disconnected port ECLKO\n", ci->name.c_str(ctx));
+                for (auto user : eclko->users) {
+                    if (user.cell->type == id_TRELLIS_ECLKBUF) {
+                        Loc eckbuf_loc =
+                                ctx->getBelLocation(ctx->getBelByName(ctx->id(user.cell->attrs.at(ctx->id("BEL")))));
+                        for (auto bel : ctx->getBels()) {
+                            if (ctx->getBelType(bel) != id_ECLKSYNCB)
+                                continue;
+                            Loc loc = ctx->getBelLocation(bel);
+                            if (loc.x == eckbuf_loc.x && loc.y == eckbuf_loc.y && loc.z == eckbuf_loc.z - 2) {
+                                ci->attrs[ctx->id("BEL")] = ctx->getBelName(bel).str(ctx);
+                                goto eclksync_done;
+                            }
+                        }
+                    }
+                }
+            eclksync_done:
+                continue;
+            } else if (ci->type == ctx->id("DDRDLLA")) {
+                ci->type = id_DDRDLL; // transform from Verilog to Bel name
+                const NetInfo *clk = net_or_nullptr(ci, id_CLK);
+                if (clk == nullptr)
+                    log_error("DDRDLLA '%s' has disconnected port CLK\n", ci->name.c_str(ctx));
+                for (auto &eclk : eclks) {
+                    if (eclk.second.unbuf == clk) {
+                        for (auto bel : ctx->getBels()) {
+                            if (ctx->getBelType(bel) != id_DDRDLL)
+                                continue;
+                            Loc loc = ctx->getBelLocation(bel);
+                            int ddrdll_bank = -1;
+                            if (loc.x < 15 && loc.y < 15)
+                                ddrdll_bank = 7;
+                            else if (loc.x < 15 && loc.y > 15)
+                                ddrdll_bank = 6;
+                            else if (loc.x > 15 && loc.y < 15)
+                                ddrdll_bank = 2;
+                            else if (loc.x > 15 && loc.y > 15)
+                                ddrdll_bank = 3;
+                            if (eclk.first.first != ddrdll_bank)
+                                continue;
+                            ci->attrs[ctx->id("BEL")] = ctx->getBelName(bel).str(ctx);
+                            make_eclk(ci->ports.at(id_CLK), ci, bel, eclk.first.first);
+                            goto ddrdll_done;
+                        }
+                    }
+                }
+            ddrdll_done:
+                continue;
+            }
+        }
+
         flush_cells();
     };
 
@@ -1527,6 +2025,7 @@ class Ecp5Packer
     void pack()
     {
         pack_io();
+        pack_dqsbuf();
         pack_iologic();
         pack_ebr();
         pack_dsps();
