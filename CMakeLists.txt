@@ -26,7 +26,7 @@ if (EXTERNAL_CHIPDB)
 endif()
 
 # List of families to build
-set(FAMILIES generic ice40 ecp5)
+set(FAMILIES generic ice40 ecp5 leuctra)
 
 set(ARCH "" CACHE STRING "Architecture family for nextpnr build")
 set_property(CACHE ARCH PROPERTY STRINGS ${FAMILIES})
