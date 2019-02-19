@@ -43,6 +43,11 @@ void IdString::initialize_arch(const BaseCtx *ctx)
     // because we need to have bba loaded.
 }
 
+Arch::Arch(ArchArgs args) : args(args)
+{
+    // XXX meat
+}
+
 // -----------------------------------------------------------------------
 
 BelId Arch::getBelByName(IdString name) const
@@ -275,6 +280,23 @@ std::vector<IdString> Arch::getBelPins(BelId bel) const
 
 // -----------------------------------------------------------------------
 
+delay_t Arch::estimateDelay(WireId src, WireId dst) const
+{
+    // TODO
+    return 13;
+}
+
+delay_t Arch::predictDelay(const NetInfo *net_info, const PortRef &sink) const
+{
+    // TODO
+    return 13;
+}
+
+bool Arch::getBudgetOverride(const NetInfo *net_info, const PortRef &sink, delay_t &budget) const { return false; }
+
+
+// -----------------------------------------------------------------------
+
 bool Arch::place() { return placer1(getCtx(), Placer1Cfg(getCtx())); }
 
 bool Arch::route() { return router1(getCtx(), Router1Cfg(getCtx())); }
@@ -336,5 +358,31 @@ DecalXY Arch::getWireDecal(WireId wire) const { return {}; }
 DecalXY Arch::getPipDecal(PipId pip) const { return {}; };
 
 DecalXY Arch::getGroupDecal(GroupId pip) const { return {}; };
+
+// -----------------------------------------------------------------------
+
+bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayInfo &delay) const
+{
+    // XXX
+    delay.min_delay = 11;
+    delay.max_delay = 13;
+    return true;
+}
+
+TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const
+{
+    // XXX
+    return TMG_IGNORE;
+}
+
+TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port, int index) const
+{
+    TimingClockingInfo info;
+    info.setup = getDelayFromNS(0);
+    info.hold = getDelayFromNS(0);
+    info.clockToQ = getDelayFromNS(0);
+    // XXX
+    return info;
+}
 
 NEXTPNR_NAMESPACE_END

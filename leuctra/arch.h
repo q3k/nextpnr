@@ -213,11 +213,15 @@ NPNR_PACKED_STRUCT(struct BelPOD {
 	FLAG_VN = 0x20,
 	// Multi-function pin used by the configuration interface (cannot be used if Persist option given).
 	FLAG_PERSIST = 0x40,
+	// Subtype for slices.
+	FLAG_SLICEX = 0x80,
+	FLAG_SLICEL = 0x100,
+	FLAG_SLICEM = 0x200,
     };
     int32_t io_bank;
     BelFlags flags;
-    RelPtr<int32_t> related;
-    RelPtr<int32_t> conflicts;
+    RelPtr<BelIdPOD> related;
+    RelPtr<BelIdPOD> conflicts;
 });
 
 // Represents a single tile on a device.
@@ -531,7 +535,9 @@ struct Arch : BaseCtx
     mutable std::unordered_map<IdString, WireId> wire_by_name;
     mutable std::unordered_map<IdString, PipId> pip_by_name;
 
-	// XXX binding stuff
+    std::unordered_map<BelId, CellInfo *> bel_to_cell;
+    std::unordered_map<WireId, NetInfo *> wire_to_net;
+    std::unordered_map<PipId, NetInfo *> pip_to_net;
 
     ArchArgs args;
     Arch(ArchArgs args);
@@ -604,10 +610,25 @@ struct Arch : BaseCtx
 
     uint32_t getBelChecksum(BelId bel) const { return bel.index; }
 
-    // XXX impl
-    void bindBel(BelId bel, CellInfo *cell, PlaceStrength strength);
-    // XXX impl
-    void unbindBel(BelId bel);
+    void bindBel(BelId bel, CellInfo *cell, PlaceStrength strength)
+    {
+        NPNR_ASSERT(bel != BelId());
+        NPNR_ASSERT(bel_to_cell[bel] == nullptr);
+        bel_to_cell[bel] = cell;
+        cell->bel = bel;
+        cell->belStrength = strength;
+        refreshUiBel(bel);
+    }
+
+    void unbindBel(BelId bel)
+    {
+        NPNR_ASSERT(bel != BelId());
+        NPNR_ASSERT(bel_to_cell[bel] != nullptr);
+        bel_to_cell[bel]->bel = BelId();
+        bel_to_cell[bel]->belStrength = STRENGTH_NONE;
+        bel_to_cell[bel] = nullptr;
+        refreshUiBel(bel);
+    }
 
     Loc getBelLocation(BelId bel) const
     {
@@ -648,10 +669,40 @@ struct Arch : BaseCtx
 	return getBelTypeInfo(bel).flags & BelTypePOD::FLAG_IS_GLOBAL_BUF;
     }
 
-    // XXX impl×3
-    bool checkBelAvail(BelId bel) const;
-    CellInfo *getBoundBelCell(BelId bel) const;
-    CellInfo *getConflictingBelCell(BelId bel) const;
+    bool checkBelAvail(BelId bel) const
+    {
+	return getConflictingBelCell(bel) == nullptr;
+    }
+
+    CellInfo *getBoundBelCell(BelId bel) const
+    {
+        NPNR_ASSERT(bel != BelId());
+	if (bel_to_cell.find(bel) == bel_to_cell.end())
+	    return nullptr;
+	else
+            return bel_to_cell.at(bel);
+    }
+
+    CellInfo *getConflictingBelCell(BelId bel) const
+    {
+        NPNR_ASSERT(bel != BelId());
+        CellInfo *ret = getBoundBelCell(bel);
+	if (ret != nullptr)
+	    return ret;
+	auto &bt = getBelTypeInfo(bel);
+	auto &tile = getTile(bel.location);
+	for (int i = 0; i < bt.num_conflicts; i++) {
+	    auto &other_pod = tile.bels[bel.index].conflicts[i];
+	    BelId other;
+	    other.location.x = other_pod.tile_x;
+	    other.location.y = other_pod.tile_y;
+	    other.index = other_pod.bel_idx;
+	    ret = getBoundBelCell(other);
+	    if (ret != nullptr)
+		return ret;
+	}
+	return nullptr;
+    }
 
     BelRange getBels() const
     {
@@ -721,22 +772,58 @@ struct Arch : BaseCtx
 
     uint32_t getWireChecksum(WireId wire) const { return wire.index; }
 
-    // XXX impl
-    void bindWire(WireId wire, NetInfo *net, PlaceStrength strength);
+    void bindWire(WireId wire, NetInfo *net, PlaceStrength strength)
+    {
+        NPNR_ASSERT(wire != WireId());
+        NPNR_ASSERT(wire_to_net[wire] == nullptr);
+        wire_to_net[wire] = net;
+        net->wires[wire].pip = PipId();
+        net->wires[wire].strength = strength;
+    }
 
-    // XXX impl
-    void unbindWire(WireId wire);
+    void unbindWire(WireId wire)
+    {
+        NPNR_ASSERT(wire != WireId());
+        NPNR_ASSERT(wire_to_net[wire] != nullptr);
 
-    // XXX impl
-    bool checkWireAvail(WireId wire) const;
+        auto &net_wires = wire_to_net[wire]->wires;
+        auto it = net_wires.find(wire);
+        NPNR_ASSERT(it != net_wires.end());
 
-    // XXX impl
-    NetInfo *getBoundWireNet(WireId wire) const;
+        auto pip = it->second.pip;
+        if (pip != PipId()) {
+            pip_to_net[pip] = nullptr;
+        }
+
+        net_wires.erase(it);
+        wire_to_net[wire] = nullptr;
+    }
+
+    bool checkWireAvail(WireId wire) const
+    {
+        NPNR_ASSERT(wire != WireId());
+        return wire_to_net.find(wire) == wire_to_net.end() || wire_to_net.at(wire) == nullptr;
+    }
+
+    NetInfo *getBoundWireNet(WireId wire) const
+    {
+        NPNR_ASSERT(wire != WireId());
+        if (wire_to_net.find(wire) == wire_to_net.end())
+            return nullptr;
+        else
+            return wire_to_net.at(wire);
+    }
 
     WireId getConflictingWireWire(WireId wire) const { return wire; }
 
-    // XXX impl
-    NetInfo *getConflictingWireNet(WireId wire) const;
+    NetInfo *getConflictingWireNet(WireId wire) const
+    {
+        NPNR_ASSERT(wire != WireId());
+        if (wire_to_net.find(wire) == wire_to_net.end())
+            return nullptr;
+        else
+            return wire_to_net.at(wire);
+    }
 
     DelayInfo getWireDelay(WireId wire) const
     {
@@ -803,22 +890,58 @@ struct Arch : BaseCtx
 
     uint32_t getPipChecksum(PipId pip) const { return pip.index; }
 
-    // XXX impl
-    void bindPip(PipId pip, NetInfo *net, PlaceStrength strength);
+    void bindPip(PipId pip, NetInfo *net, PlaceStrength strength)
+    {
+        NPNR_ASSERT(pip != PipId());
+        NPNR_ASSERT(pip_to_net[pip] == nullptr);
 
-    // XXX impl
-    void unbindPip(PipId pip);
+        pip_to_net[pip] = net;
 
-    // XXX impl
-    bool checkPipAvail(PipId pip) const;
+        WireId dst = getPipDstWire(pip);
+        NPNR_ASSERT(wire_to_net[dst] == nullptr);
+        wire_to_net[dst] = net;
+        net->wires[dst].pip = pip;
+        net->wires[dst].strength = strength;
+    }
 
-    // XXX impl
-    NetInfo *getBoundPipNet(PipId pip) const;
+    void unbindPip(PipId pip)
+    {
+        NPNR_ASSERT(pip != PipId());
+        NPNR_ASSERT(pip_to_net[pip] != nullptr);
+
+        WireId dst = getPipDstWire(pip);
+        NPNR_ASSERT(wire_to_net[dst] != nullptr);
+        wire_to_net[dst] = nullptr;
+        pip_to_net[pip]->wires.erase(dst);
+
+        pip_to_net[pip] = nullptr;
+    }
+
+    bool checkPipAvail(PipId pip) const
+    {
+        NPNR_ASSERT(pip != PipId());
+        return pip_to_net.find(pip) == pip_to_net.end() || pip_to_net.at(pip) == nullptr;
+    }
+
+    NetInfo *getBoundPipNet(PipId pip) const
+    {
+        NPNR_ASSERT(pip != PipId());
+        if (pip_to_net.find(pip) == pip_to_net.end())
+            return nullptr;
+        else
+            return pip_to_net.at(pip);
+    }
 
     WireId getConflictingPipWire(PipId pip) const { return WireId(); }
 
-    // XXX impl
-    NetInfo *getConflictingPipNet(PipId pip) const;
+    NetInfo *getConflictingPipNet(PipId pip) const
+    {
+        NPNR_ASSERT(pip != PipId());
+        if (pip_to_net.find(pip) == pip_to_net.end())
+            return nullptr;
+        else
+            return pip_to_net.at(pip);
+    }
 
     AllPipRange getPips() const
     {
@@ -1001,22 +1124,14 @@ struct Arch : BaseCtx
     TimingPortClass getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const;
     // Get the TimingClockingInfo of a port
     TimingClockingInfo getPortClockingInfo(const CellInfo *cell, IdString port, int index) const;
-    // Return true if a port is a net
-    bool isGlobalNet(const NetInfo *net) const;
-
-    bool getDelayFromTimingDatabase(IdString tctype, IdString from, IdString to, DelayInfo &delay) const;
-    void getSetupHoldFromTimingDatabase(IdString tctype, IdString clock, IdString port, DelayInfo &setup,
-                                        DelayInfo &hold) const;
 
     // -------------------------------------------------
     // Placement validity checks
-    bool isValidBelForCell(CellInfo *cell, BelId bel) const;
-    bool isBelLocationValid(BelId bel) const;
+    // TODO: validate bel subtype (SLICEM vs SLICEL, IOBM vs IOBS, ...).
+    bool isValidBelForCell(CellInfo *cell, BelId bel) const { return true; }
+    bool isBelLocationValid(BelId bel) const { return true; }
 
-    // Helper function for above
-    bool slicesCompatible(const std::vector<const CellInfo *> &cells) const;
-
-    void assignArchInfo();
+    //void assignArchInfo();
 };
 
 NEXTPNR_NAMESPACE_END
