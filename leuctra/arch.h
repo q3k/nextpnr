@@ -21,6 +21,8 @@
 #error Include "arch.h" via "nextpnr.h" only.
 #endif
 
+#include <boost/iostreams/device/mapped_file.hpp>
+
 NEXTPNR_NAMESPACE_BEGIN
 
 /**** Everything in this section must be kept in sync with chipdb.py ****/
@@ -164,6 +166,13 @@ NPNR_PACKED_STRUCT(struct TileTypePOD {
     RelPtr<TileTypePortPOD> ports;
 });
 
+NPNR_PACKED_STRUCT(struct DeviceCatalogueEntryPOD {
+    // Device name (what the user selects).
+    int32_t name_id;
+    // The basename of the bba file for the device.
+    int32_t db_name_id;
+});
+
 NPNR_PACKED_STRUCT(struct FamilyPOD {
     // Must be equal to DB_FORMAT_TAG_CURRENT, used to identify db format revision.
     uint32_t format_tag;
@@ -171,8 +180,9 @@ NPNR_PACKED_STRUCT(struct FamilyPOD {
     uint32_t db_tag;
     // Family name.
     int32_t name_id;
-    // Device names in this family (to be loaded from separate bbas).
-    RelPtr<int32_t> device_name_ids;
+    // Devices in this family (to be loaded from separate bbas).
+    int32_t num_devices;
+    RelPtr<DeviceCatalogueEntryPOD> devices;
     // The initial IdString mapping.
     int32_t num_idstrings;
     RelPtr<RelPtr<char>> idstrings;
@@ -202,21 +212,30 @@ NPNR_PACKED_STRUCT(struct BelIdPOD {
 NPNR_PACKED_STRUCT(struct BelPOD {
     enum BelFlags : uint32_t {
         // Differential positive / negative terminal.
-        FLAG_DIFF_P = 0x1,
-        FLAG_DIFF_N = 0x2,
-	// IOB without output buffer.
-	FLAG_INPUT_ONLY = 0x4,
+        FLAG_IO_DIFF_P = 0x1,
+        FLAG_IO_DIFF_N = 0x2,
+	// IOB without output buffer (Spartan 3E, 3A).
+	FLAG_IO_INPUT_ONLY = 0x4,
+	// Left or right IOB (Spartan 3A).
+	FLAR_IO_LR = 0x8,
+	// Low-capacitance IOB (Virtex 4).
+	FLAG_IO_LOWCAP = 0x10,
+	// High Performance vs High Range IO (Series 7) -- applies to IOBs, [IO]LOGIC, [IO]DELAY.
+	FLAG_IO_HP = 0x20,
+	FLAG_IO_HR = 0x40,
 	// VREF pad (cannot be used if VREF IO standard used in the same bank).
-	FLAG_VREF = 0x8,
+	FLAG_IO_VREF = 0x80,
 	// Positive / negative DCI calibration pad (cannot be used if DCI IO standard used in the same bank).
-	FLAG_VP = 0x10,
-	FLAG_VN = 0x20,
+	FLAG_IO_VP = 0x100,
+	FLAG_IO_VN = 0x200,
 	// Multi-function pin used by the configuration interface (cannot be used if Persist option given).
-	FLAG_PERSIST = 0x40,
+	FLAG_IO_PERSIST = 0x400,
 	// Subtype for slices.
-	FLAG_SLICEX = 0x80,
-	FLAG_SLICEL = 0x100,
-	FLAG_SLICEM = 0x200,
+	FLAG_SLICEX = 0x800,
+	FLAG_SLICEL = 0x1000,
+	FLAG_SLICEM = 0x2000,
+	// For Virtex 6 and Series 7 18-kbit RAM: set if this bel can fit a FIFO18E1.
+	FLAG_FIFO = 0x4000,
     };
     int32_t io_bank;
     BelFlags flags;
@@ -527,6 +546,32 @@ struct ArchArgs
 
 struct Arch : BaseCtx
 {
+    enum Family {
+	FAMILY_XC4000E, // Also known as Spartan.
+	FAMILY_XC4000EX, // Also xc4000xl.
+	FAMILY_XC4000XLA,
+	FAMILY_XC4000XV,
+	FAMILY_SPARTANXL,
+	FAMILY_VIRTEX, // Also known as Spartan 2.
+	FAMILY_VIRTEXE, // Also known as Spartan 2E.
+	FAMILY_VIRTEX2,
+	FAMILY_VIRTEX2P,
+	FAMILY_SPARTAN3,
+	FAMILY_SPARTAN3E,
+	FAMILY_SPARTAN3A,
+	FAMILY_SPARTAN3ADSP,
+	FAMILY_VIRTEX4,
+	FAMILY_VIRTEX5,
+	FAMILY_VIRTEX6,
+	FAMILY_SPARTAN6,
+	FAMILY_SERIES7,
+	FAMILY_ULTRASCALE,
+	FAMILY_ULTRASCALE_PLUS,
+    } family;
+
+    boost::iostreams::mapped_file_source mmap_family;
+    boost::iostreams::mapped_file_source mmap_device;
+
     const FamilyPOD *family_info;
     const DevicePOD *device_info;
     const PackageInfoPOD *package_info;

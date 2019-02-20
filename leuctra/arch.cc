@@ -43,9 +43,197 @@ void IdString::initialize_arch(const BaseCtx *ctx)
     // because we need to have bba loaded.
 }
 
+// Given a device name, figure out what family it belongs to.
+static Arch::Family device_to_family(const std::string &device)
+{
+    size_t pos = 0;
+
+    // Skip the prefix.
+    if (device.substr(0, 2) == "xc")
+	pos += 2;
+    else if (device.substr(0, 2) == "xa")
+	pos += 2;
+    else if (device.substr(0, 2) == "xq")
+	pos += 2;
+    else if (device.substr(0, 3) == "xqr")
+	pos += 3;
+    auto raw = device.substr(pos);
+
+    if (raw.substr(0, 2) == "vu" || raw.substr(0, 2) == "ku") {
+	// Ultrascale or Ultrascale+ (needs to be checked before original Virtex).
+	if (raw.substr(raw.size() - 1) == "p")
+	    return Arch::FAMILY_ULTRASCALE_PLUS;
+	return Arch::FAMILY_ULTRASCALE;
+    } else if (raw.substr(0, 2) == "zu") {
+	// Zynq Ultrascale+.
+	return Arch::FAMILY_ULTRASCALE_PLUS;
+    } else if (raw.substr(0, 1) == "7") {
+	// 7 Series.
+	return Arch::FAMILY_SERIES7;
+    } else if (raw.substr(0, 2) == "6s") {
+	return Arch::FAMILY_SPARTAN6;
+    } else if (raw.substr(0, 2) == "6v") {
+	return Arch::FAMILY_VIRTEX6;
+    } else if (raw.substr(0, 2) == "5v") {
+	return Arch::FAMILY_VIRTEX5;
+    } else if (raw.substr(0, 2) == "4v") {
+	return Arch::FAMILY_VIRTEX4;
+    } else if (raw.substr(0, 3) == "3sd") {
+	// Needs to be checked before other Spartan 3 variants.
+	return Arch::FAMILY_SPARTAN3ADSP;
+    } else if (raw.substr(0, 2) == "3s") {
+	// One of many Spartan 3 variants.
+	if (raw.substr(raw.size() - 1) == "e")
+	    return Arch::FAMILY_SPARTAN3E;
+	if (raw.substr(raw.size() - 1) == "a")
+	    return Arch::FAMILY_SPARTAN3A;
+	if (raw.substr(raw.size() - 2) == "an")
+	    return Arch::FAMILY_SPARTAN3A;
+	return Arch::FAMILY_SPARTAN3;
+    } else if (raw.substr(0, 2) == "2v") {
+	// Virtex 2 or Virtex 2 Pro.
+	if (raw.substr(raw.size() - 1) == "p")
+	    return Arch::FAMILY_VIRTEX2P;
+	return Arch::FAMILY_VIRTEX2;
+    } else if (raw.substr(0, 1) == "v" || raw.substr(0, 2) == "2s") {
+	// Virtex or Virtex E.
+	if (raw.substr(raw.size() - 1) == "e")
+	    return Arch::FAMILY_VIRTEXE;
+	return Arch::FAMILY_VIRTEX;
+    } else if (raw.substr(0, 1) == "s") {
+	// Spartan or Spartan XL.
+	if (raw.size() >= 2 && raw.substr(raw.size() - 2) == "xl")
+	    return Arch::FAMILY_SPARTANXL;
+	return Arch::FAMILY_XC4000E;
+    } else if (raw.substr(0, 2) == "40") {
+	// One of the xc4000 families.
+	if (raw.substr(raw.size() - 1) == "e")
+	    return Arch::FAMILY_XC4000E;
+	if (raw.substr(raw.size() - 2) == "ex")
+	    return Arch::FAMILY_XC4000EX;
+	if (raw.substr(raw.size() - 2) == "xl")
+	    return Arch::FAMILY_XC4000EX;
+	if (raw.size() >= 3 && raw.substr(raw.size() - 3) == "xla")
+	    return Arch::FAMILY_XC4000XLA;
+	if (raw.substr(raw.size() - 2) == "xv")
+	    return Arch::FAMILY_XC4000XV;
+    }
+    log_error("Unknown device family.\n");
+}
+
+static std::string family_name(Arch::Family family) {
+    switch(family) {
+	case Arch::FAMILY_XC4000E:
+	    return "xc4000e";
+	case Arch::FAMILY_XC4000EX:
+	    return "xc4000ex";
+	case Arch::FAMILY_XC4000XLA:
+	    return "xc4000xla";
+	case Arch::FAMILY_XC4000XV:
+	    return "xc4000xv";
+	case Arch::FAMILY_SPARTANXL:
+	    return "spartanxl";
+	case Arch::FAMILY_VIRTEX:
+	    return "virtex";
+	case Arch::FAMILY_VIRTEXE:
+	    return "virtexe";
+	case Arch::FAMILY_VIRTEX2:
+	    return "virtex2";
+	case Arch::FAMILY_VIRTEX2P:
+	    return "virtex2p";
+	case Arch::FAMILY_SPARTAN3:
+	    return "spartan3";
+	case Arch::FAMILY_SPARTAN3E:
+	    return "spartan3e";
+	case Arch::FAMILY_SPARTAN3A:
+	    return "spartan3a";
+	case Arch::FAMILY_SPARTAN3ADSP:
+	    return "spartan3adsp";
+	case Arch::FAMILY_VIRTEX4:
+	    return "virtex4";
+	case Arch::FAMILY_VIRTEX5:
+	    return "virtex5";
+	case Arch::FAMILY_VIRTEX6:
+	    return "virtex6";
+	case Arch::FAMILY_SPARTAN6:
+	    return "spartan6";
+	case Arch::FAMILY_SERIES7:
+	    return "series7";
+	case Arch::FAMILY_ULTRASCALE:
+	    return "ultrascale";
+	case Arch::FAMILY_ULTRASCALE_PLUS:
+	    return "ultrascaleplus";
+    }
+    NPNR_ASSERT_FALSE("strange family");
+    return "";
+}
+
 Arch::Arch(ArchArgs args) : args(args)
 {
-    // XXX meat
+    // Select and load family bba.
+    family = device_to_family(args.device);
+    std::string fname = family_name(family);
+    std::string family_filename = EXTERNAL_CHIPDB_ROOT "/leuctra/" + fname + ".bin";
+    try {
+        mmap_family.open(family_filename);
+        if (!mmap_family.is_open())
+            log_error("Unable to read chipdb %s\n", family_filename.c_str());
+    } catch (...) {
+        log_error("Unable to read chipdb %s\n", family_filename.c_str());
+    }
+    family_info = reinterpret_cast<const FamilyPOD *>(mmap_family.data());
+    if (family_info->format_tag != DB_FORMAT_TAG_CURRENT)
+        log_error("Chipdb %s has wrong format tag\n", family_filename.c_str());
+
+    // Slurp IdStrings.
+    // Entry 0 must be "".
+    NPNR_ASSERT(family_info->idstrings[0].get()[0] == 0);
+    for (int i = 1; i < family_info->num_idstrings; i++)
+	IdString::initialize_add(this, family_info->idstrings[i].get(), i);
+
+    // Make double sure we got the right family.
+    if (IdString(family_info->name_id).str(this) != fname)
+        log_error("Chipdb %s is for strange family\n", family_filename.c_str());
+
+    // Search for the device file.
+    int dev_name_id = id(args.device).index;
+    int db_name_id = -1;
+    for (int i = 0; i < family_info->num_devices; i++) {
+	if (family_info->devices[i].name_id == dev_name_id) {
+	    db_name_id = family_info->devices[i].db_name_id;
+	    break;
+	}
+    }
+    if (db_name_id == -1)
+	log_error("Unknown device.\n");
+
+    // Load device file.
+    std::string device_filename = EXTERNAL_CHIPDB_ROOT "/leuctra/" + IdString(db_name_id).str(this) + ".bin";
+    try {
+        mmap_device.open(device_filename);
+        if (!mmap_device.is_open())
+            log_error("Unable to read chipdb %s\n", device_filename.c_str());
+    } catch (...) {
+        log_error("Unable to read chipdb %s\n", device_filename.c_str());
+    }
+    device_info = reinterpret_cast<const DevicePOD *>(mmap_device.data());
+    if (device_info->format_tag != DB_FORMAT_TAG_CURRENT)
+        log_error("Chipdb %s has wrong format tag\n", device_filename.c_str());
+    if (device_info->db_tag != family_info->db_tag)
+        log_error("Chipdb %s has mismatched db tag\n", device_filename.c_str());
+    if (device_info->name_id != db_name_id)
+        log_error("Chipdb %s is for strange device\n", device_filename.c_str());
+
+    // Find the right package.
+    int pkg_name_id = id(args.package).index;
+    for (int i = 0; i < device_info->num_packages; i++) {
+	if (device_info->packages[i].name_id == pkg_name_id) {
+	    package_info = &device_info->packages[i];
+	    break;
+	}
+    }
+    if (package_info == nullptr)
+	log_error("Unknown package.");
 }
 
 // -----------------------------------------------------------------------
