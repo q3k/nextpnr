@@ -503,33 +503,18 @@ std::vector<GraphicElement> Arch::getDecalGraphics(DecalId decal) const
         BelId bel;
         bel.index = decal.z;
         bel.location = decal.location;
-        // XXX
-#if 0
-        int z = locInfo(bel)->bel_data[bel.index].z;
-        auto bel_type = getBelType(bel);
+	int max_z = getTileBelDimZ(bel.location.x, bel.location.y);
+        int z = bel.index;
+        //auto bel_type = getBelType(bel);
 
-        if (bel_type == id_TRELLIS_SLICE) {
-            GraphicElement el;
-            el.type = GraphicElement::TYPE_BOX;
-            el.style = decal.active ? GraphicElement::STYLE_ACTIVE : GraphicElement::STYLE_INACTIVE;
-            el.x1 = bel.location.x + logic_cell_x1;
-            el.x2 = bel.location.x + logic_cell_x2;
-            el.y1 = bel.location.y + logic_cell_y1 + (z)*logic_cell_pitch;
-            el.y2 = bel.location.y + logic_cell_y2 + (z)*logic_cell_pitch;
-            ret.push_back(el);
-        }
-
-        if (bel_type == id_TRELLIS_IO) {
-            GraphicElement el;
-            el.type = GraphicElement::TYPE_BOX;
-            el.style = decal.active ? GraphicElement::STYLE_ACTIVE : GraphicElement::STYLE_INACTIVE;
-            el.x1 = bel.location.x + logic_cell_x1;
-            el.x2 = bel.location.x + logic_cell_x2;
-            el.y1 = bel.location.y + logic_cell_y1 + (2 * z) * logic_cell_pitch;
-            el.y2 = bel.location.y + logic_cell_y2 + (2 * z + 0.5f) * logic_cell_pitch;
-            ret.push_back(el);
-        }
-#endif
+        GraphicElement el;
+        el.type = GraphicElement::TYPE_BOX;
+        el.style = decal.active ? GraphicElement::STYLE_ACTIVE : GraphicElement::STYLE_INACTIVE;
+        el.x1 = bel.location.x + 0.05;
+        el.x2 = bel.location.x + 0.95;
+        el.y1 = bel.location.y + (z + 0.05) / max_z;
+        el.y2 = bel.location.y + (z + 0.95) / max_z;
+        ret.push_back(el);
     }
 
     return ret;
