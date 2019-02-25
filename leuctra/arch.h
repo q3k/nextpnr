@@ -92,7 +92,7 @@ NPNR_PACKED_STRUCT(struct TileTypeWirePOD {
     int32_t type_name_id;
     // The BEL and pin this wire is attached to, if any.
     int32_t bel_idx;
-    int32_t bel_pin_name_id;
+    int32_t bel_pin_idx;
     // A list of pips referencing this wire as dst.
     int32_t num_pip_dst_xrefs;
     RelPtr<int32_t> pip_dst_xrefs;
@@ -785,7 +785,8 @@ struct Arch : BaseCtx
 	if (ttw.bel_idx != -1) {
 	    res.b.bel.location = wire.location;
 	    res.b.bel.index = ttw.bel_idx;
-	    res.b.pin.index = ttw.bel_pin_name_id;
+	    auto &bt = getBelTypeInfo(res.b.bel);
+	    res.b.pin.index = bt.pins[ttw.bel_pin_idx].name_id;
 	}
 	return res;
     }

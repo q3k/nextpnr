@@ -226,14 +226,18 @@ Arch::Arch(ArchArgs args) : args(args)
 
     // Find the right package.
     int pkg_name_id = id(args.package).index;
-    for (int i = 0; i < device_info->num_packages; i++) {
-	if (device_info->packages[i].name_id == pkg_name_id) {
-	    package_info = &device_info->packages[i];
-	    break;
-	}
+    if (pkg_name_id == 0) {
+	package_info = &device_info->packages[0];
+    } else {
+        for (int i = 0; i < device_info->num_packages; i++) {
+	    if (device_info->packages[i].name_id == pkg_name_id) {
+	        package_info = &device_info->packages[i];
+	        break;
+	    }
+        }
     }
     if (package_info == nullptr)
-	log_error("Unknown package.");
+	log_error("Unknown package.\n");
 }
 
 // -----------------------------------------------------------------------
