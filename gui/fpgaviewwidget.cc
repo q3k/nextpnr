@@ -31,6 +31,7 @@
 #include "fpgaviewwidget.h"
 #include "log.h"
 #include "mainwindow.h"
+#include "sparsevector.h"
 
 NEXTPNR_NAMESPACE_BEGIN
 
@@ -353,9 +354,9 @@ void FPGAViewWidget::renderLines(void)
         return;
 
     // Data from Context needed to render all decals.
-    std::vector<std::pair<DecalXY, BelId>> belDecals;
-    std::vector<std::pair<DecalXY, WireId>> wireDecals;
-    std::vector<std::pair<DecalXY, PipId>> pipDecals;
+    SparseVector<std::pair<DecalXY, BelId>> belDecals;
+    SparseVector<std::pair<DecalXY, WireId>> wireDecals;
+    SparseVector<std::pair<DecalXY, PipId>> pipDecals;
     std::vector<std::pair<DecalXY, GroupId>> groupDecals;
     bool decalsChanged = false;
     {
